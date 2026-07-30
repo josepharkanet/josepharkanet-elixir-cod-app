@@ -28,6 +28,7 @@ const {
   COD_FEE_TITLE = "Cash on Delivery fee",
   COD_FEE_TAXABLE = "false",
   COD_GATEWAY_MATCH = "cash on delivery",
+  COD_NOTIFY_CUSTOMER = "true", // email the customer the updated order (with the fee). Set "false" to add silently.
   PORT = "3000",
 } = process.env;
 
@@ -95,8 +96,8 @@ async function addCodFee(order) {
   if (addErr.length) throw new Error("add: " + JSON.stringify(addErr));
 
   const commit = await gql(
-    `mutation($id:ID!){ orderEditCommit(id:$id,notifyCustomer:false,staffNote:"COD handling fee added automatically"){ order{ id } userErrors{ message } } }`,
-    { id: calcId }
+    `mutation($id:ID!,$notify:Boolean!){ orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:"COD handling fee added automatically"){ order{ id } userErrors{ message } } }`,
+    { id: calcId, notify: COD_NOTIFY_CUSTOMER !== "false" }
   );
   if (!commit?.data?.orderEditCommit?.order?.id) throw new Error("commit: " + JSON.stringify(commit?.data?.orderEditCommit?.userErrors || commit));
 

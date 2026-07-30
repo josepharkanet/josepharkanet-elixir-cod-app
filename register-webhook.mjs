@@ -17,8 +17,18 @@ async function getToken() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: "client_credentials" }),
   });
-  const j = await r.json();
-  if (!j.access_token) { console.error("✗ Token grant failed:", JSON.stringify(j)); process.exit(1); }
+  // Shopify returns OAuth errors as an HTML page, not JSON — read text and parse safely.
+  const raw = await r.text();
+  let j = null;
+  try { j = JSON.parse(raw); } catch {}
+  if (!j || !j.access_token) {
+    const title = (raw.match(/<title>([^<]*)<\/title>/) || [])[1];
+    const reason = (j && (j.error_description || j.error)) || title || `HTTP ${r.status}`;
+    console.error("✗ Token grant failed:", reason);
+    console.error("  → ELX_CLIENT_SECRET must be the ELIXIR PROMOTIONS secret (starts 'shps…'), matching client id " + CLIENT_ID + ".");
+    console.error("  → Get it with:  cd ~/Desktop/elixir-promotions && shopify app env show   (SHOPIFY_API_SECRET)");
+    process.exit(1);
+  }
   return j.access_token;
 }
 const TOKEN = await getToken();
