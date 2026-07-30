@@ -27,6 +27,7 @@ const {
   COD_FEE_CURRENCY = "AED",
   COD_FEE_TITLE = "Cash on Delivery fee",
   COD_FEE_TAXABLE = "false",
+  COD_FEE_VARIANT_ID = "", // optional: gid of a hidden "COD Fee" product variant. If set, add THAT (shows its image) instead of a placeholder custom item.
   COD_GATEWAY_MATCH = "cash on delivery",
   COD_NOTIFY_CUSTOMER = "true", // email the customer the updated order (with the fee). Set "false" to add silently.
   PORT = "3000",
@@ -84,15 +85,31 @@ async function addCodFee(order) {
   const calcId = begin?.data?.orderEditBegin?.calculatedOrder?.id;
   if (!calcId) throw new Error("begin: " + JSON.stringify(begin?.data?.orderEditBegin?.userErrors || begin));
 
-  const add = await gql(
-    `mutation($id:ID!,$title:String!,$qty:Int!,$price:MoneyInput!,$taxable:Boolean!){
-       orderEditAddCustomItem(id:$id,title:$title,quantity:$qty,price:$price,requiresShipping:false,taxable:$taxable){
-         calculatedLineItem{ id } userErrors{ message }
-       }
-     }`,
-    { id: calcId, title: COD_FEE_TITLE, qty: 1, price: { amount: COD_FEE_AMOUNT, currencyCode: order.currency || COD_FEE_CURRENCY }, taxable: COD_FEE_TAXABLE === "true" }
-  );
-  const addErr = add?.data?.orderEditAddCustomItem?.userErrors || [];
+  let add, addErr;
+  if (COD_FEE_VARIANT_ID) {
+    // Preferred: add a hidden "COD Fee" product variant so the order line shows
+    // its image (price/tax/shipping come from that product) instead of a gray box.
+    add = await gql(
+      `mutation($id:ID!,$variantId:ID!,$qty:Int!){
+         orderEditAddVariant(id:$id,variantId:$variantId,quantity:$qty,allowDuplicates:true){
+           calculatedLineItem{ id } userErrors{ message }
+         }
+       }`,
+      { id: calcId, variantId: COD_FEE_VARIANT_ID, qty: 1 }
+    );
+    addErr = add?.data?.orderEditAddVariant?.userErrors || [];
+  } else {
+    // Fallback: a custom line item (renders with a placeholder image).
+    add = await gql(
+      `mutation($id:ID!,$title:String!,$qty:Int!,$price:MoneyInput!,$taxable:Boolean!){
+         orderEditAddCustomItem(id:$id,title:$title,quantity:$qty,price:$price,requiresShipping:false,taxable:$taxable){
+           calculatedLineItem{ id } userErrors{ message }
+         }
+       }`,
+      { id: calcId, title: COD_FEE_TITLE, qty: 1, price: { amount: COD_FEE_AMOUNT, currencyCode: order.currency || COD_FEE_CURRENCY }, taxable: COD_FEE_TAXABLE === "true" }
+    );
+    addErr = add?.data?.orderEditAddCustomItem?.userErrors || [];
+  }
   if (addErr.length) throw new Error("add: " + JSON.stringify(addErr));
 
   const commit = await gql(
