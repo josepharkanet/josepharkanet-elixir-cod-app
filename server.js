@@ -122,6 +122,104 @@ async function addCodFee(order) {
   return { added: true, order: order.name || order.id };
 }
 
+/* ------------------------------------------------------------------ gift vouchers
+ * Spend-tier reward. On a new order we read the merchant's tier config (a shop
+ * metafield set by the Elixir Promotions app), pick the % by the order subtotal,
+ * create a unique single-use discount code LOCKED to that customer, and store it
+ * on the customer (for the "My Vouchers" account page) and on the order (so the
+ * shipping-confirmation email can show it). Runs on orders/create — the same
+ * webhook the COD fee uses — so the code exists before fulfillment, which is when
+ * the email is sent (this also covers COD orders, which are not "paid" until later).
+ */
+const VOUCHER_TAG = "voucher-issued";
+let vCfg = null, vCfgExp = 0;
+
+async function voucherConfig() {
+  const now = Date.now();
+  if (vCfg !== null && now < vCfgExp) return vCfg;
+  const j = await gql(`{ shop { metafield(namespace:"elixir_promotions", key:"voucher_config"){ value } } }`);
+  let cfg = null;
+  try { const v = j?.data?.shop?.metafield?.value; cfg = v ? JSON.parse(v) : null; } catch { cfg = null; }
+  vCfg = cfg; vCfgExp = now + 60000; // cache 60s to avoid a lookup per order
+  return cfg;
+}
+
+/** Highest tier whose overAmount is strictly below the subtotal wins. 0 = none. */
+function voucherPercentFor(cfg, subtotal) {
+  let percent = 0, best = -1;
+  for (const t of (cfg.tiers || [])) {
+    const over = Number(t.overAmount) || 0;
+    if (subtotal > over && over >= best) { best = over; percent = Number(t.percent) || 0; }
+  }
+  return percent;
+}
+
+async function issueVoucher(order) {
+  const cfg = await voucherConfig();
+  if (!cfg || !cfg.active) return { skipped: "voucher program inactive" };
+
+  const customerId = order.customer && order.customer.id;
+  if (!customerId) return { skipped: "no customer on order" };
+
+  const subtotal = parseFloat(order.current_subtotal_price || order.subtotal_price || "0") || 0;
+  const percent = voucherPercentFor(cfg, subtotal);
+  if (!percent) return { skipped: "no matching tier", subtotal };
+
+  const gid = `gid://shopify/Order/${order.id}`;
+
+  // Idempotency — the webhook can be retried.
+  const cur = await gql(`query($id:ID!){ order(id:$id){ tags } }`, { id: gid });
+  if ((cur?.data?.order?.tags || []).includes(VOUCHER_TAG)) return { skipped: "voucher already issued" };
+
+  const customerGid = `gid://shopify/Customer/${customerId}`;
+  const now = new Date();
+  const expiryDays = Math.max(1, Number(cfg.expiryDays) || 90);
+  const endsAt = new Date(now.getTime() + expiryDays * 86400000);
+  const minRedeem = Number(cfg.minRedeemSubtotal) || 0;
+  const code = "ELX-GIFT-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+
+  const input = {
+    title: `Gift voucher ${percent}% (${order.name || order.id})`,
+    code,
+    startsAt: now.toISOString(),
+    endsAt: endsAt.toISOString(),
+    usageLimit: 1,
+    appliesOncePerCustomer: true,
+    customerSelection: { customers: { add: [customerGid] } },
+    customerGets: { value: { percentage: percent / 100 }, items: { all: true } },
+    combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: false },
+  };
+  if (minRedeem > 0) input.minimumRequirement = { subtotal: { greaterThanOrEqualToSubtotal: String(minRedeem) } };
+
+  const created = await gql(
+    `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ codeDiscountNode{ id } userErrors{ field message } } }`,
+    { d: input }
+  );
+  const cErr = created?.data?.discountCodeBasicCreate?.userErrors || [];
+  if (cErr.length) throw new Error("voucher create: " + JSON.stringify(cErr));
+
+  const voucher = { code, percent, expiresAt: endsAt.toISOString(), minRedeem, status: "active", issuedFor: order.name || String(order.id) };
+
+  // Append to the customer's voucher list (read-modify-write) + stamp the order.
+  const existing = await gql(`query($id:ID!){ customer(id:$id){ metafield(namespace:"custom", key:"gift_vouchers"){ value } } }`, { id: customerGid });
+  let list = [];
+  try { const v = existing?.data?.customer?.metafield?.value; list = v ? JSON.parse(v) : []; } catch { list = []; }
+  list.unshift(voucher);
+
+  const mset = await gql(
+    `mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{ field message } } }`,
+    { m: [
+      { ownerId: customerGid, namespace: "custom", key: "gift_vouchers", type: "json", value: JSON.stringify(list) },
+      { ownerId: gid, namespace: "custom", key: "gift_voucher", type: "json", value: JSON.stringify(voucher) },
+    ] }
+  );
+  const mErr = mset?.data?.metafieldsSet?.userErrors || [];
+  if (mErr.length) throw new Error("voucher metafields: " + JSON.stringify(mErr));
+
+  await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [VOUCHER_TAG] });
+  return { issued: true, code, percent, order: order.name || order.id };
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === "GET") { res.writeHead(200); res.end("COD Fee service is running."); return; }
   if (req.method !== "POST") { res.writeHead(405); res.end("Method not allowed"); return; }
@@ -134,11 +232,14 @@ const server = http.createServer((req, res) => {
     let order;
     try { order = JSON.parse(raw); } catch { res.writeHead(400); res.end("Bad JSON"); return; }
     try {
-      const result = await addCodFee(order);
+      // Both run on orders/create; each is independently idempotent (its own tag),
+      // so a webhook retry after a partial failure is safe.
+      const cod = await addCodFee(order);
+      const voucher = await issueVoucher(order);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, ...result }));
+      res.end(JSON.stringify({ ok: true, cod, voucher }));
     } catch (e) {
-      console.error("COD fee error:", e.message);
+      console.error("order webhook error:", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: e.message }));
     }
