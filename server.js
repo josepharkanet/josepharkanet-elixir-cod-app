@@ -216,6 +216,29 @@ async function issueVoucher(order) {
   const mErr = mset?.data?.metafieldsSet?.userErrors || [];
   if (mErr.length) throw new Error("voucher metafields: " + JSON.stringify(mErr));
 
+  // Shopify email notifications CANNOT read order metafields (only product/variant),
+  // but they CAN read order custom attributes via {{ attributes.key }}. So also expose
+  // the voucher as order attributes for the shipping-confirmation email. Read-modify-write
+  // to preserve any attributes already on the order (e.g. a greeting-card message).
+  const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const expiryStr = `${String(endsAt.getUTCDate()).padStart(2,"0")} ${MON[endsAt.getUTCMonth()]} ${endsAt.getUTCFullYear()}`;
+  const curAttrs = await gql(`query($id:ID!){ order(id:$id){ customAttributes{ key value } } }`, { id: gid });
+  const keep = (curAttrs?.data?.order?.customAttributes || [])
+    .filter((a) => a && a.key && !a.key.startsWith("gift_voucher_"))
+    .map((a) => ({ key: a.key, value: a.value == null ? "" : String(a.value) }));
+  const attrs = keep.concat([
+    { key: "gift_voucher_code", value: code },
+    { key: "gift_voucher_percent", value: String(percent) },
+    { key: "gift_voucher_expiry", value: expiryStr },
+    { key: "gift_voucher_minredeem", value: String(minRedeem) },
+  ]);
+  const oup = await gql(
+    `mutation($id:ID!,$a:[AttributeInput!]!){ orderUpdate(input:{id:$id, customAttributes:$a}){ userErrors{ field message } } }`,
+    { id: gid, a: attrs }
+  );
+  const oErr = oup?.data?.orderUpdate?.userErrors || [];
+  if (oErr.length) throw new Error("voucher order attributes: " + JSON.stringify(oErr));
+
   await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [VOUCHER_TAG] });
   return { issued: true, code, percent, order: order.name || order.id };
 }
