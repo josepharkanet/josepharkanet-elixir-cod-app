@@ -132,6 +132,7 @@ async function addCodFee(order) {
  * the email is sent (this also covers COD orders, which are not "paid" until later).
  */
 const VOUCHER_TAG = "voucher-issued";
+const VOUCHER_CANCELLED_TAG = "voucher-cancelled";
 let vCfg = null, vCfgExp = 0;
 
 async function voucherConfig() {
@@ -243,6 +244,80 @@ async function issueVoucher(order) {
   return { issued: true, code, percent, order: order.name || order.id };
 }
 
+/* When an order is cancelled or fully refunded/returned, revoke the voucher it
+ * earned: DEACTIVATE the discount code so it can't be redeemed, and mark it
+ * "cancelled" on the order + customer metafields (so the My Vouchers page shows
+ * it as void). Idempotent via a `voucher-cancelled` tag. */
+async function cancelVoucherForOrder(orderGid, reason) {
+  const cur = await gql(
+    `query($id:ID!){ order(id:$id){ tags customAttributes{ key value } customer{ id } metafield(namespace:"custom",key:"gift_voucher"){ value } } }`,
+    { id: orderGid }
+  );
+  const o = cur?.data?.order;
+  if (!o) return { skipped: "order not found" };
+  const tags = o.tags || [];
+  if (!tags.includes(VOUCHER_TAG)) return { skipped: "no voucher was issued for this order" };
+  if (tags.includes(VOUCHER_CANCELLED_TAG)) return { skipped: "voucher already cancelled" };
+
+  const codeAttr = (o.customAttributes || []).find((a) => a && a.key === "gift_voucher_code");
+  const code = codeAttr && codeAttr.value;
+  if (!code) return { skipped: "voucher tag present but no code found" };
+
+  // Deactivate the discount code so it can no longer be applied at checkout.
+  let deactivated = false;
+  const found = await gql(`query($code:String!){ codeDiscountNodeByCode(code:$code){ id } }`, { code });
+  const discId = found?.data?.codeDiscountNodeByCode?.id;
+  if (discId) {
+    const deact = await gql(
+      `mutation($id:ID!){ discountCodeDeactivate(id:$id){ codeDiscountNode{ id } userErrors{ field message } } }`,
+      { id: discId }
+    );
+    const dErr = deact?.data?.discountCodeDeactivate?.userErrors || [];
+    if (dErr.length) console.warn("voucher deactivate:", JSON.stringify(dErr));
+    else deactivated = true;
+  }
+
+  // Flip the stored status to "cancelled" on the order + the customer's list.
+  try {
+    const mfs = [];
+    let ov = null;
+    try { ov = o.metafield?.value ? JSON.parse(o.metafield.value) : null; } catch { ov = null; }
+    if (ov) { ov.status = "cancelled"; mfs.push({ ownerId: orderGid, namespace: "custom", key: "gift_voucher", type: "json", value: JSON.stringify(ov) }); }
+    const customerGid = o.customer && o.customer.id;
+    if (customerGid) {
+      const ex = await gql(`query($id:ID!){ customer(id:$id){ metafield(namespace:"custom",key:"gift_vouchers"){ value } } }`, { id: customerGid });
+      let list = [];
+      try { const lv = ex?.data?.customer?.metafield?.value; list = lv ? JSON.parse(lv) : []; } catch { list = []; }
+      list = list.map((x) => (x && x.code === code ? { ...x, status: "cancelled" } : x));
+      mfs.push({ ownerId: customerGid, namespace: "custom", key: "gift_vouchers", type: "json", value: JSON.stringify(list) });
+    }
+    if (mfs.length) await gql(`mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{ message } } }`, { m: mfs });
+  } catch (e) { console.warn("voucher status update:", e.message); }
+
+  await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: orderGid, tags: [VOUCHER_CANCELLED_TAG] });
+  return { cancelled: true, code, deactivated, reason };
+}
+
+/* On boot, make sure the cancel/refund webhooks exist. We reuse the callback URL
+ * of the already-registered orders/create webhook, so no extra config is needed;
+ * it is idempotent and never blocks startup. */
+async function ensureWebhooks() {
+  const existing = await gql(`{ webhookSubscriptions(first:100){ edges{ node{ topic endpoint{ __typename ... on WebhookHttpEndpoint{ callbackUrl } } } } } }`);
+  const nodes = (existing?.data?.webhookSubscriptions?.edges || []).map((e) => e.node);
+  const base = nodes.find((n) => n.topic === "ORDERS_CREATE")?.endpoint?.callbackUrl;
+  if (!base) { console.warn("ensureWebhooks: orders/create webhook not found; skipping auto-register"); return; }
+  for (const topic of ["ORDERS_CANCELLED", "REFUNDS_CREATE"]) {
+    if (nodes.some((n) => n.topic === topic && n.endpoint?.callbackUrl === base)) continue;
+    const res = await gql(
+      `mutation($t:WebhookSubscriptionTopic!,$s:WebhookSubscriptionInput!){ webhookSubscriptionCreate(topic:$t,webhookSubscription:$s){ webhookSubscription{ id } userErrors{ message } } }`,
+      { t: topic, s: { callbackUrl: base, format: "JSON" } }
+    );
+    const err = res?.data?.webhookSubscriptionCreate?.userErrors || [];
+    if (err.length) console.warn(`ensureWebhooks ${topic}:`, JSON.stringify(err));
+    else console.log(`✓ registered ${topic} → ${base}`);
+  }
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === "GET") { res.writeHead(200); res.end("COD Fee service is running."); return; }
   if (req.method !== "POST") { res.writeHead(405); res.end("Method not allowed"); return; }
@@ -252,21 +327,42 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     const raw = Buffer.concat(chunks).toString("utf8");
     if (!verifyHmac(raw, req.headers["x-shopify-hmac-sha256"] || "")) { res.writeHead(401); res.end("Invalid HMAC"); return; }
-    let order;
-    try { order = JSON.parse(raw); } catch { res.writeHead(400); res.end("Bad JSON"); return; }
+    let body;
+    try { body = JSON.parse(raw); } catch { res.writeHead(400); res.end("Bad JSON"); return; }
+    const topic = (req.headers["x-shopify-topic"] || "").toLowerCase();
     try {
-      // Both run on orders/create; each is independently idempotent (its own tag),
-      // so a webhook retry after a partial failure is safe.
-      const cod = await addCodFee(order);
-      const voucher = await issueVoucher(order);
+      let result;
+      if (topic === "orders/cancelled") {
+        // Order voided -> revoke its gift voucher.
+        result = { voucher: await cancelVoucherForOrder(`gid://shopify/Order/${body.id}`, "order cancelled") };
+      } else if (topic === "refunds/create") {
+        // Only revoke when the WHOLE order is refunded; a partial refund keeps the voucher.
+        const orderGid = `gid://shopify/Order/${body.order_id}`;
+        const ord = await gql(`query($id:ID!){ order(id:$id){ displayFinancialStatus } }`, { id: orderGid });
+        const fin = ord?.data?.order?.displayFinancialStatus;
+        result = fin === "REFUNDED"
+          ? { voucher: await cancelVoucherForOrder(orderGid, "order fully refunded") }
+          : { voucher: { skipped: `refund but order is ${fin || "not fully refunded"}; voucher kept` } };
+      } else if (topic === "orders/create" || topic === "") {
+        // Add the COD fee + issue the voucher. Each is independently idempotent
+        // (its own tag), so a webhook retry after a partial failure is safe.
+        const cod = await addCodFee(body);
+        const voucher = await issueVoucher(body);
+        result = { cod, voucher };
+      } else {
+        result = { skipped: `unhandled topic ${topic}` };
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, cod, voucher }));
+      res.end(JSON.stringify({ ok: true, topic: topic || "orders/create", ...result }));
     } catch (e) {
-      console.error("order webhook error:", e.message);
+      console.error(`webhook error (${topic || "orders/create"}):`, e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: e.message }));
     }
   });
 });
 
-server.listen(Number(PORT), () => console.log(`COD Fee service listening on :${PORT}`));
+server.listen(Number(PORT), () => {
+  console.log(`COD Fee service listening on :${PORT}`);
+  ensureWebhooks().catch((e) => console.warn("ensureWebhooks:", e.message));
+});
