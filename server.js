@@ -133,6 +133,8 @@ async function addCodFee(order) {
  */
 const VOUCHER_TAG = "voucher-issued";
 const VOUCHER_CANCELLED_TAG = "voucher-cancelled";
+const VOUCHER_MAX_ISSUED = 25;                            // T&C: first 25 customers
+const VOUCHER_PROGRAM_END = "2026-09-30T23:59:59+04:00";  // T&C: valid until 30 Sep 2026 (Gulf time)
 let vCfg = null, vCfgExp = 0;
 
 async function voucherConfig() {
@@ -171,6 +173,12 @@ async function issueVoucher(order) {
   // Idempotency — the webhook can be retried.
   const cur = await gql(`query($id:ID!){ order(id:$id){ tags } }`, { id: gid });
   if ((cur?.data?.order?.tags || []).includes(VOUCHER_TAG)) return { skipped: "voucher already issued" };
+
+  // T&C caps: the offer ends 30 Sep 2026 and is limited to the first 25 vouchers.
+  if (Date.now() > new Date(VOUCHER_PROGRAM_END).getTime()) return { skipped: "voucher program ended (30 Sep 2026)" };
+  const issuedRes = await gql(`query($q:String){ ordersCount(query:$q){ count } }`, { q: `tag:${VOUCHER_TAG}` });
+  const issuedSoFar = issuedRes?.data?.ordersCount?.count ?? 0;
+  if (issuedSoFar >= VOUCHER_MAX_ISSUED) return { skipped: `voucher cap reached (${VOUCHER_MAX_ISSUED} issued)` };
 
   const customerGid = `gid://shopify/Customer/${customerId}`;
   const now = new Date();
