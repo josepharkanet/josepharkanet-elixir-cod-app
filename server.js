@@ -174,11 +174,20 @@ async function issueVoucher(order) {
   const cur = await gql(`query($id:ID!){ order(id:$id){ tags } }`, { id: gid });
   if ((cur?.data?.order?.tags || []).includes(VOUCHER_TAG)) return { skipped: "voucher already issued" };
 
-  // T&C caps: the offer ends 30 Sep 2026 and is limited to the first 25 vouchers.
-  if (Date.now() > new Date(VOUCHER_PROGRAM_END).getTime()) return { skipped: "voucher program ended (30 Sep 2026)" };
-  const issuedRes = await gql(`query($q:String){ ordersCount(query:$q){ count } }`, { q: `tag:${VOUCHER_TAG}` });
-  const issuedSoFar = issuedRes?.data?.ordersCount?.count ?? 0;
-  if (issuedSoFar >= VOUCHER_MAX_ISSUED) return { skipped: `voucher cap reached (${VOUCHER_MAX_ISSUED} issued)` };
+  // T&C caps — merchant-managed in the Gift Vouchers screen (cfg.endDate,
+  // cfg.maxRedemptions), falling back to the built-in defaults for a config that
+  // predates these fields. endDate "" = no end; maxRedemptions 0 = unlimited.
+  const endStr = (cfg.endDate !== undefined) ? String(cfg.endDate).trim() : VOUCHER_PROGRAM_END;
+  if (endStr) {
+    const endMs = new Date(/[T ]\d\d:/.test(endStr) ? endStr : endStr + "T23:59:59+04:00").getTime();
+    if (Number.isFinite(endMs) && Date.now() > endMs) return { skipped: "voucher program ended", endDate: endStr };
+  }
+  const cap = (cfg.maxRedemptions !== undefined) ? Number(cfg.maxRedemptions) : VOUCHER_MAX_ISSUED;
+  if (cap > 0) {
+    const issuedRes = await gql(`query($q:String){ ordersCount(query:$q){ count } }`, { q: `tag:${VOUCHER_TAG}` });
+    const issuedSoFar = issuedRes?.data?.ordersCount?.count ?? 0;
+    if (issuedSoFar >= cap) return { skipped: `voucher cap reached (${cap} issued)` };
+  }
 
   const customerGid = `gid://shopify/Customer/${customerId}`;
   const now = new Date();
