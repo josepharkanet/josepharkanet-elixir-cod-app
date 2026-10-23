@@ -30,6 +30,7 @@ const {
   COD_FEE_VARIANT_ID = "", // optional: gid of a hidden "COD Fee" product variant. If set, add THAT (shows its image) instead of a placeholder custom item.
   COD_GATEWAY_MATCH = "cash on delivery",
   COD_NOTIFY_CUSTOMER = "true", // email the customer the updated order (with the fee). Set "false" to add silently.
+  GIFT_BOX_VARIANT_ID = "", // gid of the hidden "Gift Box" variant. Empty = feature off.
   PORT = "3000",
 } = process.env;
 
@@ -120,6 +121,51 @@ async function addCodFee(order) {
 
   await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [TAG] });
   return { added: true, order: order.name || order.id };
+}
+
+/* ------------------------------------------------------------------ gift box
+ * Every Elixir order ships with complimentary gift packaging, so every order
+ * carries a Gift Box line at zero cost. It is there to tell the packer, and to
+ * show the customer what is included, so it has to appear on the invoice and the
+ * pickup slip. Priced 0 and not taxable, so no total changes and the customer is
+ * not emailed an "order edited" notice over a free line.
+ */
+const GIFT_BOX_TAG = "gift-box-added";
+
+async function addGiftBox(order) {
+  if (!GIFT_BOX_VARIANT_ID) return { skipped: "gift box not configured" };
+  const gid = `gid://shopify/Order/${order.id}`;
+
+  // Idempotency — the webhook can be retried, and a second free box on the
+  // invoice would have the packer sending two.
+  const cur = await gql(`query($id:ID!){ order(id:$id){ tags lineItems(first:100){ nodes{ variant{ id } } } } }`, { id: gid });
+  const tags = cur?.data?.order?.tags || [];
+  if (tags.includes(GIFT_BOX_TAG)) return { skipped: "already added" };
+  const already = (cur?.data?.order?.lineItems?.nodes || []).some((li) => li.variant && li.variant.id === GIFT_BOX_VARIANT_ID);
+  if (already) return { skipped: "gift box already on the order" };
+
+  const begin = await gql(`mutation($id:ID!){ orderEditBegin(id:$id){ calculatedOrder{ id } userErrors{ message } } }`, { id: gid });
+  const calcId = begin?.data?.orderEditBegin?.calculatedOrder?.id;
+  if (!calcId) throw new Error("giftbox begin: " + JSON.stringify(begin?.data?.orderEditBegin?.userErrors || begin));
+
+  const add = await gql(
+    `mutation($id:ID!,$variantId:ID!,$qty:Int!){
+       orderEditAddVariant(id:$id,variantId:$variantId,quantity:$qty,allowDuplicates:false){
+         calculatedOrder{ id } userErrors{ message } } }`,
+    { id: calcId, variantId: GIFT_BOX_VARIANT_ID, qty: 1 }
+  );
+  const addErr = add?.data?.orderEditAddVariant?.userErrors || [];
+  if (addErr.length) throw new Error("giftbox add: " + JSON.stringify(addErr));
+
+  // Never notify: the total does not move, so an edit email would only confuse.
+  const commit = await gql(
+    `mutation($id:ID!){ orderEditCommit(id:$id,notifyCustomer:false,staffNote:"Complimentary gift box added automatically"){ order{ id } userErrors{ message } } }`,
+    { id: calcId }
+  );
+  if (!commit?.data?.orderEditCommit?.order?.id) throw new Error("giftbox commit: " + JSON.stringify(commit?.data?.orderEditCommit?.userErrors || commit));
+
+  await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [GIFT_BOX_TAG] });
+  return { added: true, variantId: GIFT_BOX_VARIANT_ID };
 }
 
 /* ------------------------------------------------------------------ gift vouchers
@@ -364,8 +410,9 @@ const server = http.createServer((req, res) => {
         // Add the COD fee + issue the voucher. Each is independently idempotent
         // (its own tag), so a webhook retry after a partial failure is safe.
         const cod = await addCodFee(body);
+        const giftBox = await addGiftBox(body);
         const voucher = await issueVoucher(body);
-        result = { cod, voucher };
+        result = { cod, giftBox, voucher };
       } else {
         result = { skipped: `unhandled topic ${topic}` };
       }
