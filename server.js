@@ -29,7 +29,7 @@ const {
   COD_FEE_TAXABLE = "false",
   COD_FEE_VARIANT_ID = "", // optional: gid of a hidden "COD Fee" product variant. If set, add THAT (shows its image) instead of a placeholder custom item.
   COD_GATEWAY_MATCH = "cash on delivery",
-  COD_NOTIFY_CUSTOMER = "true", // email the customer the updated order (with the fee). Set "false" to add silently.
+  COD_NOTIFY_CUSTOMER = "false", // see the commit note on the edit below. Set "true" only if you mean it.
   GIFT_BOX_VARIANT_ID = "", // gid of the hidden "Gift Box" variant. Empty = feature off.
   PORT = "3000",
 } = process.env;
@@ -113,9 +113,16 @@ async function addCodFee(order) {
   }
   if (addErr.length) throw new Error("add: " + JSON.stringify(addErr));
 
+  // Never notify by default. Adding the fee raises the balance due, and on an unpaid order
+  // Shopify answers notifyCustomer:true with its INVOICE email: "Payment of X is due" over a
+  // Pay now button. Every one of these orders is cash on delivery, so that email invites the
+  // customer to pay online for an amount the courier is already on the way to collect in cash.
+  // EL 1055 was paid by card on 17 Nov 2026 after exactly this email, three days after the
+  // customer chose COD. The fee still needs to reach the customer, but through the invoice the
+  // packer encloses, not a payment link.
   const commit = await gql(
     `mutation($id:ID!,$notify:Boolean!){ orderEditCommit(id:$id,notifyCustomer:$notify,staffNote:"COD handling fee added automatically"){ order{ id } userErrors{ message } } }`,
-    { id: calcId, notify: COD_NOTIFY_CUSTOMER !== "false" }
+    { id: calcId, notify: COD_NOTIFY_CUSTOMER === "true" }
   );
   if (!commit?.data?.orderEditCommit?.order?.id) throw new Error("commit: " + JSON.stringify(commit?.data?.orderEditCommit?.userErrors || commit));
 
