@@ -176,16 +176,29 @@ async function addGiftBox(order) {
 }
 
 /* ------------------------------------------------------------------ gift vouchers
- * Spend-tier reward. On a new order we read the merchant's tier config (a shop
- * metafield set by the Elixir Promotions app), pick the % by the order subtotal,
- * create a unique single-use discount code LOCKED to that customer, and store it
- * on the customer (for the "My Vouchers" account page) and on the order (so the
- * shipping-confirmation email can show it). Runs on orders/create — the same
- * webhook the COD fee uses — so the code exists before fulfillment, which is when
- * the email is sent (this also covers COD orders, which are not "paid" until later).
+ * Every purchase earns a voucher, with no condition on the order that earned it.
+ * What the voucher is WORTH is decided by the order it is SPENT on: under the
+ * threshold it is the lower percentage, at or over it the higher one.
+ *
+ * A Shopify discount code carries one fixed percentage, so that ladder cannot live
+ * on a single code. Each reward is therefore issued as one code per rung, both
+ * locked to the customer and single-use: a 10% code with no minimum, and a 20% code
+ * that needs a 2,500 subtotal. They share a group id carried in the code itself
+ * (ELX-GIFT-<group>-<percent>), and the moment one is redeemed the rest of its group
+ * is deactivated, so a purchase still earns exactly one reward.
+ *
+ * cfg.tiers is that ladder. overAmount is the subtotal the rung needs on the NEXT
+ * order, 0 meaning no minimum, and it becomes the code's minimum purchase
+ * requirement, which Shopify evaluates as greater-than-or-equal. That is what makes
+ * "equal or more than 2,500" land on the 20% rung rather than just above it.
+ *
+ * Runs on orders/create, the same webhook the COD fee uses, so the codes exist
+ * before fulfillment, which is when the email goes out. That also covers COD orders,
+ * which are not "paid" until much later.
  */
 const VOUCHER_TAG = "voucher-issued";
 const VOUCHER_CANCELLED_TAG = "voucher-cancelled";
+const VOUCHER_SPENT_TAG = "voucher-spent";
 const VOUCHER_MAX_ISSUED = 25;                            // T&C: first 25 customers
 const VOUCHER_PROGRAM_END = "2026-09-30T23:59:59+04:00";  // T&C: valid until 30 Sep 2026 (Gulf time)
 let vCfg = null, vCfgExp = 0;
@@ -200,14 +213,42 @@ async function voucherConfig() {
   return cfg;
 }
 
-/** Highest tier whose overAmount is strictly below the subtotal wins. 0 = none. */
-function voucherPercentFor(cfg, subtotal) {
-  let percent = 0, best = -1;
-  for (const t of (cfg.tiers || [])) {
-    const over = Number(t.overAmount) || 0;
-    if (subtotal > over && over >= best) { best = over; percent = Number(t.percent) || 0; }
+/** The redeem ladder: one code per rung, cheapest to reach first. */
+function voucherLadder(cfg) {
+  const seen = new Set();
+  return (cfg.tiers || [])
+    .map((t) => ({ percent: Number(t.percent) || 0, minRedeem: Math.max(0, Number(t.overAmount) || 0) }))
+    .filter((t) => {
+      if (t.percent <= 0) return false;
+      const key = t.percent + "@" + t.minRedeem;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.minRedeem - b.minRedeem);
+}
+
+/** Deactivate one code by its string. Returns whether it actually went inactive. */
+async function deactivateCode(code) {
+  const found = await gql(`query($code:String!){ codeDiscountNodeByCode(code:$code){ id } }`, { code });
+  const id = found?.data?.codeDiscountNodeByCode?.id;
+  if (!id) return false;
+  const deact = await gql(
+    `mutation($id:ID!){ discountCodeDeactivate(id:$id){ codeDiscountNode{ id } userErrors{ field message } } }`,
+    { id }
+  );
+  const errs = deact?.data?.discountCodeDeactivate?.userErrors || [];
+  if (errs.length) { console.warn("voucher deactivate:", JSON.stringify(errs)); return false; }
+  return true;
+}
+
+/** Every code in a stored voucher record, new ladder shape or the single-code one before it. */
+function groupCodes(record, fallback) {
+  if (record && Array.isArray(record.codes) && record.codes.length) {
+    return record.codes.map((c) => c && c.code).filter(Boolean);
   }
-  return percent;
+  if (record && record.code) return [record.code];
+  return fallback ? [fallback] : [];
 }
 
 async function issueVoucher(order) {
@@ -217,9 +258,10 @@ async function issueVoucher(order) {
   const customerId = order.customer && order.customer.id;
   if (!customerId) return { skipped: "no customer on order" };
 
-  const subtotal = parseFloat(order.current_subtotal_price || order.subtotal_price || "0") || 0;
-  const percent = voucherPercentFor(cfg, subtotal);
-  if (!percent) return { skipped: "no matching tier", subtotal };
+  // No condition on the order that earns it. The ladder only decides what it is worth
+  // when it is spent, so an empty ladder is the only thing that stops a voucher here.
+  const ladder = voucherLadder(cfg);
+  if (!ladder.length) return { skipped: "no voucher tiers configured" };
 
   const gid = `gid://shopify/Order/${order.id}`;
 
@@ -246,36 +288,54 @@ async function issueVoucher(order) {
   const now = new Date();
   const expiryDays = Math.max(1, Number(cfg.expiryDays) || 90);
   const endsAt = new Date(now.getTime() + expiryDays * 86400000);
-  const minRedeem = Number(cfg.minRedeemSubtotal) || 0;
-  const code = "ELX-GIFT-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+  // A floor the merchant can put under the whole programme, on top of each rung's own.
+  const floor = Number(cfg.minRedeemSubtotal) || 0;
+  const group = crypto.randomBytes(4).toString("hex").toUpperCase();
+  const issuedFor = order.name || String(order.id);
 
-  const input = {
-    title: `Gift voucher ${percent}% (${order.name || order.id})`,
-    code,
-    startsAt: now.toISOString(),
-    endsAt: endsAt.toISOString(),
-    usageLimit: 1,
-    appliesOncePerCustomer: true,
-    customerSelection: { customers: { add: [customerGid] } },
-    customerGets: { value: { percentage: percent / 100 }, items: { all: true } },
-    combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: false },
-  };
-  if (minRedeem > 0) input.minimumRequirement = { subtotal: { greaterThanOrEqualToSubtotal: String(minRedeem) } };
+  const issued = [];
+  for (const rung of ladder) {
+    const minRedeem = Math.max(rung.minRedeem, floor);
+    const code = `ELX-GIFT-${group}-${rung.percent}`;
+    const input = {
+      title: `Gift voucher ${rung.percent}% (${issuedFor})`,
+      code,
+      startsAt: now.toISOString(),
+      endsAt: endsAt.toISOString(),
+      usageLimit: 1,
+      appliesOncePerCustomer: true,
+      customerSelection: { customers: { add: [customerGid] } },
+      customerGets: { value: { percentage: rung.percent / 100 }, items: { all: true } },
+      combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: false },
+    };
+    // greaterThanOrEqualToSubtotal, so 2,500 exactly earns the higher rung
+    if (minRedeem > 0) input.minimumRequirement = { subtotal: { greaterThanOrEqualToSubtotal: String(minRedeem) } };
 
-  const created = await gql(
-    `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ codeDiscountNode{ id } userErrors{ field message } } }`,
-    { d: input }
-  );
-  const cErr = created?.data?.discountCodeBasicCreate?.userErrors || [];
-  if (cErr.length) throw new Error("voucher create: " + JSON.stringify(cErr));
+    const created = await gql(
+      `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ codeDiscountNode{ id } userErrors{ field message } } }`,
+      { d: input }
+    );
+    const cErr = created?.data?.discountCodeBasicCreate?.userErrors || [];
+    if (cErr.length) {
+      // Roll back the rungs already created, or the customer is left holding half a ladder.
+      for (const v of issued) await deactivateCode(v.code).catch(() => {});
+      throw new Error("voucher create: " + JSON.stringify(cErr));
+    }
+    issued.push({ code, percent: rung.percent, minRedeem, group, expiresAt: endsAt.toISOString(), status: "active", issuedFor });
+  }
 
-  const voucher = { code, percent, expiresAt: endsAt.toISOString(), minRedeem, status: "active", issuedFor: order.name || String(order.id) };
+  const base = issued[0];
+  const upgrade = issued.length > 1 ? issued[issued.length - 1] : null;
+  const percent = base.percent;
+  const code = base.code;
+  const minRedeem = base.minRedeem;
+  const voucher = { group, expiresAt: endsAt.toISOString(), status: "active", issuedFor, codes: issued.map((v) => ({ code: v.code, percent: v.percent, minRedeem: v.minRedeem })) };
 
   // Append to the customer's voucher list (read-modify-write) + stamp the order.
   const existing = await gql(`query($id:ID!){ customer(id:$id){ metafield(namespace:"custom", key:"gift_vouchers"){ value } } }`, { id: customerGid });
   let list = [];
   try { const v = existing?.data?.customer?.metafield?.value; list = v ? JSON.parse(v) : []; } catch { list = []; }
-  list.unshift(voucher);
+  list.unshift(...issued);
 
   const mset = await gql(
     `mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{ field message } } }`,
@@ -297,12 +357,19 @@ async function issueVoucher(order) {
   const keep = (curAttrs?.data?.order?.customAttributes || [])
     .filter((a) => a && a.key && !a.key.startsWith("gift_voucher_"))
     .map((a) => ({ key: a.key, value: a.value == null ? "" : String(a.value) }));
+  // The existing four keys still describe the base rung, so an email written against
+  // them keeps working untouched. The upgrade_* keys are the second rung, for the line
+  // that tells the customer what the same reward is worth on a larger order.
   const attrs = keep.concat([
     { key: "gift_voucher_code", value: code },
     { key: "gift_voucher_percent", value: String(percent) },
     { key: "gift_voucher_expiry", value: expiryStr },
     { key: "gift_voucher_minredeem", value: String(minRedeem) },
-  ]);
+  ]).concat(upgrade ? [
+    { key: "gift_voucher_upgrade_code", value: upgrade.code },
+    { key: "gift_voucher_upgrade_percent", value: String(upgrade.percent) },
+    { key: "gift_voucher_upgrade_min", value: String(upgrade.minRedeem) },
+  ] : []);
   const oup = await gql(
     `mutation($id:ID!,$a:[AttributeInput!]!){ orderUpdate(input:{id:$id, customAttributes:$a}){ userErrors{ field message } } }`,
     { id: gid, a: attrs }
@@ -311,7 +378,50 @@ async function issueVoucher(order) {
   if (oErr.length) throw new Error("voucher order attributes: " + JSON.stringify(oErr));
 
   await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [VOUCHER_TAG] });
-  return { issued: true, code, percent, order: order.name || order.id };
+  return { issued: true, group, codes: issued.map((v) => ({ code: v.code, percent: v.percent, minRedeem: v.minRedeem })), order: issuedFor };
+}
+
+/* One purchase earns one reward, but the reward is several codes, so the moment the
+ * customer spends one the rest of its group has to stop working, or a single purchase
+ * would pay out twice. The group id travels inside the code, so a redemption is traced
+ * back without a lookup table. Idempotent via a `voucher-spent` tag. */
+async function retireVoucherGroup(order) {
+  const used = (order.discount_codes || [])
+    .map((d) => String((d && d.code) || "").trim().toUpperCase())
+    .filter(Boolean);
+  const groups = [...new Set(
+    used.map((c) => (c.match(/^ELX-GIFT-([0-9A-Z]+)-\d+$/) || [])[1]).filter(Boolean)
+  )];
+  if (!groups.length) return { skipped: "no laddered gift voucher used" };
+
+  const gid = `gid://shopify/Order/${order.id}`;
+  const cur = await gql(`query($id:ID!){ order(id:$id){ tags customer{ id } } }`, { id: gid });
+  const o = cur?.data?.order;
+  if (!o) return { skipped: "order not found" };
+  if ((o.tags || []).includes(VOUCHER_SPENT_TAG)) return { skipped: "group already retired" };
+
+  const customerGid = o.customer && o.customer.id;
+  if (!customerGid) return { skipped: "no customer on order" };
+
+  const ex = await gql(`query($id:ID!){ customer(id:$id){ metafield(namespace:"custom",key:"gift_vouchers"){ value } } }`, { id: customerGid });
+  let list = [];
+  try { const v = ex?.data?.customer?.metafield?.value; list = v ? JSON.parse(v) : []; } catch { list = []; }
+
+  const retired = [];
+  for (const v of list) {
+    if (!v || !v.code || !groups.includes(v.group)) continue;
+    if (used.includes(String(v.code).toUpperCase())) { v.status = "redeemed"; continue; }
+    if (v.status !== "active") continue;
+    if (await deactivateCode(v.code)) retired.push(v.code);
+    v.status = "superseded";
+  }
+
+  await gql(
+    `mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{ message } } }`,
+    { m: [{ ownerId: customerGid, namespace: "custom", key: "gift_vouchers", type: "json", value: JSON.stringify(list) }] }
+  );
+  await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: gid, tags: [VOUCHER_SPENT_TAG] });
+  return { spent: used.filter((c) => /^ELX-GIFT-/.test(c)), retired };
 }
 
 /* When an order is cancelled or fully refunded/returned, revoke the voucher it
@@ -329,43 +439,34 @@ async function cancelVoucherForOrder(orderGid, reason) {
   if (!tags.includes(VOUCHER_TAG)) return { skipped: "no voucher was issued for this order" };
   if (tags.includes(VOUCHER_CANCELLED_TAG)) return { skipped: "voucher already cancelled" };
 
+  let record = null;
+  try { record = o.metafield?.value ? JSON.parse(o.metafield.value) : null; } catch { record = null; }
   const codeAttr = (o.customAttributes || []).find((a) => a && a.key === "gift_voucher_code");
-  const code = codeAttr && codeAttr.value;
-  if (!code) return { skipped: "voucher tag present but no code found" };
+  // Every rung of the reward, so a cancelled order cannot leave the 20% code alive.
+  const codes = groupCodes(record, codeAttr && codeAttr.value);
+  if (!codes.length) return { skipped: "voucher tag present but no code found" };
 
-  // Deactivate the discount code so it can no longer be applied at checkout.
-  let deactivated = false;
-  const found = await gql(`query($code:String!){ codeDiscountNodeByCode(code:$code){ id } }`, { code });
-  const discId = found?.data?.codeDiscountNodeByCode?.id;
-  if (discId) {
-    const deact = await gql(
-      `mutation($id:ID!){ discountCodeDeactivate(id:$id){ codeDiscountNode{ id } userErrors{ field message } } }`,
-      { id: discId }
-    );
-    const dErr = deact?.data?.discountCodeDeactivate?.userErrors || [];
-    if (dErr.length) console.warn("voucher deactivate:", JSON.stringify(dErr));
-    else deactivated = true;
-  }
+  const deactivatedCodes = [];
+  for (const c of codes) if (await deactivateCode(c)) deactivatedCodes.push(c);
 
   // Flip the stored status to "cancelled" on the order + the customer's list.
   try {
     const mfs = [];
-    let ov = null;
-    try { ov = o.metafield?.value ? JSON.parse(o.metafield.value) : null; } catch { ov = null; }
+    const ov = record;
     if (ov) { ov.status = "cancelled"; mfs.push({ ownerId: orderGid, namespace: "custom", key: "gift_voucher", type: "json", value: JSON.stringify(ov) }); }
     const customerGid = o.customer && o.customer.id;
     if (customerGid) {
       const ex = await gql(`query($id:ID!){ customer(id:$id){ metafield(namespace:"custom",key:"gift_vouchers"){ value } } }`, { id: customerGid });
       let list = [];
       try { const lv = ex?.data?.customer?.metafield?.value; list = lv ? JSON.parse(lv) : []; } catch { list = []; }
-      list = list.map((x) => (x && x.code === code ? { ...x, status: "cancelled" } : x));
+      list = list.map((x) => (x && codes.includes(x.code) ? { ...x, status: "cancelled" } : x));
       mfs.push({ ownerId: customerGid, namespace: "custom", key: "gift_vouchers", type: "json", value: JSON.stringify(list) });
     }
     if (mfs.length) await gql(`mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ userErrors{ message } } }`, { m: mfs });
   } catch (e) { console.warn("voucher status update:", e.message); }
 
   await gql(`mutation($id:ID!,$tags:[String!]!){ tagsAdd(id:$id,tags:$tags){ userErrors{ message } } }`, { id: orderGid, tags: [VOUCHER_CANCELLED_TAG] });
-  return { cancelled: true, code, deactivated, reason };
+  return { cancelled: true, codes, deactivated: deactivatedCodes, reason };
 }
 
 /* On boot, make sure the cancel/refund webhooks exist. We reuse the callback URL
@@ -418,8 +519,11 @@ const server = http.createServer((req, res) => {
         // (its own tag), so a webhook retry after a partial failure is safe.
         const cod = await addCodFee(body);
         const giftBox = await addGiftBox(body);
+        // Retire first: this order may both SPEND an old reward and EARN a new one, and
+        // the new group must not be in the list while the old one is being swept.
+        const spent = await retireVoucherGroup(body);
         const voucher = await issueVoucher(body);
-        result = { cod, giftBox, voucher };
+        result = { cod, giftBox, spent, voucher };
       } else {
         result = { skipped: `unhandled topic ${topic}` };
       }
