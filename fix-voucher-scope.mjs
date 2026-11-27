@@ -20,8 +20,14 @@ const CLIENT_SECRET = process.env.ELX_CLIENT_SECRET;
 const FULL_PRICE_HANDLE = "full-price-no-offers";
 const APPLY = process.argv.includes("--apply");
 
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error("Set ELX_CLIENT_ID and ELX_CLIENT_SECRET.");
+const PLACEHOLDER = /^\.*$|^<.*>$|^your[-_]/i;
+if (!CLIENT_ID || !CLIENT_SECRET || PLACEHOLDER.test(CLIENT_ID) || PLACEHOLDER.test(CLIENT_SECRET)) {
+  console.error(
+    "Set real values for ELX_CLIENT_ID and ELX_CLIENT_SECRET.\n" +
+    "These are the COD app's client credentials, the same pair server.js uses as\n" +
+    "SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET. They live with the deployed service,\n" +
+    "not in this folder. See .env.example for the names."
+  );
   process.exit(1);
 }
 
@@ -30,7 +36,16 @@ async function getToken() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: "client_credentials" }),
   });
-  const j = await r.json();
+  // A wrong client id gets an HTML error page, not JSON, so read text and decide.
+  const body = await r.text();
+  let j;
+  try {
+    j = JSON.parse(body);
+  } catch {
+    console.error(`Shopify returned ${r.status} and an HTML page instead of a token.`);
+    console.error("That usually means the client id or secret is wrong, or the app is not installed on this shop.");
+    process.exit(1);
+  }
   if (!j.access_token) { console.error("token failed:", JSON.stringify(j)); process.exit(1); }
   return j.access_token;
 }
