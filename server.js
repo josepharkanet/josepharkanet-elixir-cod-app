@@ -196,6 +196,40 @@ async function addGiftBox(order) {
  * before fulfillment, which is when the email goes out. That also covers COD orders,
  * which are not "paid" until much later.
  */
+/* A markdown promo rewrites real prices and leaves compareAtPrice behind, so those
+ * products show a strike-through and gather in an automated offers collection. A voucher
+ * must never reach them, or the customer takes a second cut off an already reduced price.
+ * This collection is the mirror of the offers one: every product NOT currently marked down.
+ * Looked up by handle once per process rather than hard-coded, so it survives a restore.
+ * If it is missing we fall back to the old behaviour and say so, because refusing to mint
+ * the voucher would break the promise made on the product page. */
+const FULL_PRICE_HANDLE = "full-price-no-offers";
+let fullPriceGid; // undefined = not looked up yet, null = not found
+
+async function fullPriceCollection() {
+  if (fullPriceGid !== undefined) return fullPriceGid;
+  try {
+    const j = await gql(
+      `query($q:String!){ collections(first:1, query:$q){ nodes{ id handle } } }`,
+      { q: `handle:${FULL_PRICE_HANDLE}` }
+    );
+    const n = j?.data?.collections?.nodes?.[0];
+    fullPriceGid = n?.handle === FULL_PRICE_HANDLE ? n.id : null;
+  } catch {
+    fullPriceGid = null;
+  }
+  if (!fullPriceGid) {
+    console.warn(`[voucher] collection "${FULL_PRICE_HANDLE}" not found - vouchers will apply to every product, including ones already marked down`);
+  }
+  return fullPriceGid;
+}
+
+/** What a voucher may be spent on: full-price products only. */
+async function voucherItemsScope() {
+  const gid = await fullPriceCollection();
+  return gid ? { collections: { add: [gid] } } : { all: true };
+}
+
 const VOUCHER_TAG = "voucher-issued";
 const VOUCHER_CANCELLED_TAG = "voucher-cancelled";
 const VOUCHER_SPENT_TAG = "voucher-spent";
@@ -294,6 +328,7 @@ async function issueVoucher(order) {
   const issuedFor = order.name || String(order.id);
 
   const issued = [];
+  const itemsScope = await voucherItemsScope();
   for (const rung of ladder) {
     const minRedeem = Math.max(rung.minRedeem, floor);
     const code = `ELX-GIFT-${group}-${rung.percent}`;
@@ -305,7 +340,7 @@ async function issueVoucher(order) {
       usageLimit: 1,
       appliesOncePerCustomer: true,
       customerSelection: { customers: { add: [customerGid] } },
-      customerGets: { value: { percentage: rung.percent / 100 }, items: { all: true } },
+      customerGets: { value: { percentage: rung.percent / 100 }, items: itemsScope },
       combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: false },
     };
     // greaterThanOrEqualToSubtotal, so 2,500 exactly earns the higher rung
